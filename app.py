@@ -22,6 +22,7 @@ EXPECTED_VENDAS = ["Data", "Cliente", "Total"]
 EXPECTED_BALANCETE = ["Conta", "Descricao", "Saldo"]
 EXPECTED_FOLHA = ["Data", "Tipo", "Categoria", "Valor"]
 EXPECTED_CLIENTES = ["Cliente"]
+EXPECTED_BANCO = ["Data", "Descricao", "Tipo", "Valor"]
 
 SUGESTOES_FILE = Path("sugestoes_utilizadores.csv")
 
@@ -453,7 +454,62 @@ def standardize_clientes(df: pd.DataFrame) -> pd.DataFrame:
         out["Cliente"] = out["Cliente"].astype(str).str.strip()
 
     return out.dropna(subset=[c for c in ["Cliente"] if c in out.columns])
+def standardize_banco(df: pd.DataFrame) -> pd.DataFrame:
+    raw = normalize_columns(df)
 
+    rename_map = {
+        "data": "Data",
+        "descricao": "Descricao",
+        "descrição": "Descricao",
+        "movimento": "Descricao",
+        "historico": "Descricao",
+        "histórico": "Descricao",
+        "tipo": "Tipo",
+        "entradaesaida": "Tipo",
+        "debitocredito": "Tipo",
+        "debitoCredito": "Tipo",
+        "valor": "Valor",
+        "montante": "Valor",
+        "total": "Valor",
+        "referencia": "Referencia",
+        "referência": "Referencia",
+        "documento": "Referencia",
+    }
+
+    raw = raw.rename(columns={c: rename_map.get(c, c) for c in raw.columns})
+    cols = [c for c in ["Data", "Descricao", "Tipo", "Valor", "Referencia"] if c in raw.columns]
+    out = raw[cols].copy()
+
+    if "Data" in out.columns:
+        out["Data"] = pd.to_datetime(out["Data"], dayfirst=True, errors="coerce")
+
+    if "Valor" in out.columns:
+        out["Valor"] = clean_number(out["Valor"])
+
+    if "Descricao" not in out.columns:
+        out["Descricao"] = "N/D"
+
+    if "Referencia" not in out.columns:
+        out["Referencia"] = "N/D"
+
+    if "Tipo" in out.columns:
+        out["Tipo"] = out["Tipo"].astype(str).str.strip().str.lower()
+        out["Tipo"] = out["Tipo"].replace({
+            "entrada": "entrada",
+            "credito": "entrada",
+            "crédito": "entrada",
+            "recebimento": "entrada",
+            "receita": "entrada",
+            "saida": "saida",
+            "saída": "saida",
+            "debito": "saida",
+            "débito": "saida",
+            "pagamento": "saida",
+            "despesa": "saida",
+        })
+
+    out = out.dropna(subset=[c for c in ["Data", "Tipo", "Valor"] if c in out.columns])
+    return out
 
 def folha_to_balancete(df_folha: pd.DataFrame) -> pd.DataFrame:
     if df_folha.empty:
@@ -656,11 +712,7 @@ def build_metrics(
 
     if "TipoConta" not in bal.columns:
         bal["TipoConta"] = bal.apply(
-            lambda row: classify_account_type(
-                row.get("Conta", ""),
-                row.get("Descricao", ""),
-                pais_classificacao,
-            ),
+            lambda row: classify_account_type(row.get("Conta", ""), row.get("Descricao", ""), pais_classificacao),
             axis=1,
         )
 
@@ -672,45 +724,23 @@ def build_metrics(
     vendas["Semana_Label"] = vendas["Semana_Ordem"].dt.strftime("%d %b %Y")
 
     faturacao_total = float(vendas["Total"].sum()) if not vendas.empty else 0.0
-    reference_date = (
-        pd.Timestamp(vendas["Data"].max()).normalize()
-        if not vendas.empty
-        else pd.Timestamp.today().normalize()
-    )
+    reference_date = pd.Timestamp(vendas["Data"].max()).normalize() if not vendas.empty else pd.Timestamp.today().normalize()
     bounds = date_bounds(reference_date)
 
     faturacao_diaria = vendas.groupby("Dia", as_index=False)["Total"].sum().sort_values("Dia")
 
-    docs_diarios = (
-        vendas.groupby("Dia", as_index=False)["Documento"]
-        .count()
-        .rename(columns={"Documento": "NumDocs"})
-    )
-
+    docs_diarios = vendas.groupby("Dia", as_index=False)["Documento"].count().rename(columns={"Documento": "NumDocs"})
     ticket_diario = faturacao_diaria.merge(docs_diarios, on="Dia", how="left")
     ticket_diario["TicketMedio"] = ticket_diario["Total"] / ticket_diario["NumDocs"].replace(0, pd.NA)
 
-    faturacao_semanal = (
-        vendas.groupby(["Semana_Ordem", "Semana_Label"], as_index=False)["Total"]
-        .sum()
-        .sort_values("Semana_Ordem")
-    )
-
-    faturacao_mensal = (
-        vendas.groupby(["Mes_Ordem", "Mes"], as_index=False)["Total"]
-        .sum()
-        .sort_values("Mes_Ordem")
-    )
+    faturacao_semanal = vendas.groupby(["Semana_Ordem", "Semana_Label"], as_index=False)["Total"].sum().sort_values("Semana_Ordem")
+    faturacao_mensal = vendas.groupby(["Mes_Ordem", "Mes"], as_index=False)["Total"].sum().sort_values("Mes_Ordem")
 
     semana_atual = sum_between(vendas, bounds["week_start"], bounds["ref"])
     semana_anterior = sum_between(vendas, bounds["week_prev_start"], bounds["week_prev_end"])
     mtd = sum_between(vendas, bounds["month_start"], bounds["ref"])
     mtd_mes_anterior = sum_between(vendas, bounds["prev_month_start"], bounds["prev_month_same_day"])
-    mtd_homologo = sum_between(
-        vendas,
-        bounds["same_period_last_year_month_start"],
-        bounds["same_period_last_year_month_end"],
-    )
+    mtd_homologo = sum_between(vendas, bounds["same_period_last_year_month_start"], bounds["same_period_last_year_month_end"])
     ytd = sum_between(vendas, bounds["year_start"], bounds["ref"])
     ytd_homologo = sum_between(vendas, bounds["prev_year_start"], bounds["prev_year_same_day"])
 
@@ -719,27 +749,13 @@ def build_metrics(
     var_mtd_homologo = safe_pct(mtd, mtd_homologo)
     var_ytd_homologo = safe_pct(ytd, ytd_homologo)
 
-    top_clientes = (
-        vendas.groupby("Cliente", as_index=False)["Total"]
-        .sum()
-        .sort_values("Total", ascending=False)
-        .head(10)
-    )
+    top_clientes = vendas.groupby("Cliente", as_index=False)["Total"].sum().sort_values("Total", ascending=False).head(10)
+    top_clientes["Perc_Faturacao"] = (top_clientes["Total"] / faturacao_total) * 100 if faturacao_total else 0.0
 
-    top_clientes["Perc_Faturacao"] = (
-        (top_clientes["Total"] / faturacao_total) * 100 if faturacao_total else 0.0
-    )
-
-    top_clientes_mtd = vendas[
-        (vendas["Data"] >= bounds["month_start"]) & (vendas["Data"] <= bounds["ref"])
-    ].copy()
-
+    top_clientes_mtd_base = vendas[(vendas["Data"] >= bounds["month_start"]) & (vendas["Data"] <= bounds["ref"])].copy()
     top_clientes_mtd = (
-        top_clientes_mtd.groupby("Cliente", as_index=False)["Total"]
-        .sum()
-        .sort_values("Total", ascending=False)
-        .head(10)
-        if not top_clientes_mtd.empty
+        top_clientes_mtd_base.groupby("Cliente", as_index=False)["Total"].sum().sort_values("Total", ascending=False).head(10)
+        if not top_clientes_mtd_base.empty
         else pd.DataFrame(columns=["Cliente", "Total"])
     )
 
@@ -756,57 +772,18 @@ def build_metrics(
 
     if not bal_custos.empty:
         bal_custos["Classe"] = bal_custos["Conta"].astype(str).str[:2]
-        custos_por_classe = (
-            bal_custos.groupby("Classe", as_index=False)["Saldo"]
-            .sum()
-            .sort_values("Saldo", ascending=False)
-        )
+        custos_por_classe = bal_custos.groupby("Classe", as_index=False)["Saldo"].sum().sort_values("Saldo", ascending=False)
+        custos_por_classe["Perc_Custo"] = (custos_por_classe["Saldo"] / custos_total) * 100 if custos_total else 0.0
     else:
-        custos_por_classe = pd.DataFrame(columns=["Classe", "Saldo"])
+        custos_por_classe = pd.DataFrame(columns=["Classe", "Saldo", "Perc_Custo"])
 
-    if custos_total and not custos_por_classe.empty:
-        custos_por_classe["Perc_Custo"] = (custos_por_classe["Saldo"] / custos_total) * 100
-    elif not custos_por_classe.empty:
-        custos_por_classe["Perc_Custo"] = 0.0
-
-    proveitos_folha = 0.0
-    custos_folha = 0.0
-
-    if df_folha is not None and not df_folha.empty:
-        proveitos_folha = float(df_folha.loc[df_folha["Tipo"] == "proveito", "Valor"].sum())
-        custos_folha = float(df_folha.loc[df_folha["Tipo"] == "custo", "Valor"].sum())
+    proveitos_folha = float(df_folha.loc[df_folha["Tipo"] == "proveito", "Valor"].sum()) if df_folha is not None and not df_folha.empty else 0.0
+    custos_folha = float(df_folha.loc[df_folha["Tipo"] == "custo", "Valor"].sum()) if df_folha is not None and not df_folha.empty else 0.0
 
     resultado_estimado = faturacao_total - custos_total
     margem_estimada = (resultado_estimado / faturacao_total * 100) if faturacao_total else 0.0
 
-    num_clientes = int(vendas["Cliente"].nunique()) if not vendas.empty else 0
-    ticket_medio_global = (faturacao_total / len(vendas)) if len(vendas) else 0.0
-
     alertas = []
-
-    if var_semana is not None:
-        if var_semana >= 5:
-            alertas.append({"level": "green", "title": "Semana atual", "text": f"A semana atual está {var_semana:.1f}% acima da semana anterior."})
-        elif var_semana <= -5:
-            alertas.append({"level": "red", "title": "Semana atual", "text": f"A semana atual está {abs(var_semana):.1f}% abaixo da semana anterior."})
-        else:
-            alertas.append({"level": "yellow", "title": "Semana atual", "text": "A semana atual está próxima do ritmo da semana anterior."})
-
-    if var_mtd_homologo is not None:
-        if var_mtd_homologo >= 5:
-            alertas.append({"level": "green", "title": "MTD vs homólogo", "text": f"O mês até agora está {var_mtd_homologo:.1f}% acima do mesmo período do ano anterior."})
-        elif var_mtd_homologo <= -5:
-            alertas.append({"level": "red", "title": "MTD vs homólogo", "text": f"O mês até agora está {abs(var_mtd_homologo):.1f}% abaixo do mesmo período do ano anterior."})
-
-    if pct_top3 >= 70:
-        alertas.append({"level": "red", "title": "Dependência de clientes", "text": f"{pct_top3:.1f}% da faturação do mês depende dos 3 principais clientes."})
-    elif pct_top3 >= 50:
-        alertas.append({"level": "yellow", "title": "Dependência de clientes", "text": f"{pct_top3:.1f}% da faturação do mês depende dos 3 principais clientes."})
-
-    if not custos_por_classe.empty:
-        top_classe = str(custos_por_classe.iloc[0]["Classe"])
-        top_classe_pct = float(custos_por_classe.iloc[0]["Perc_Custo"])
-        alertas.append({"level": "yellow" if top_classe_pct >= 45 else "green", "title": "Estrutura de custos", "text": f"A maior fatia dos custos está na classe {top_classe} ({top_classe_pct:.1f}%)."})
 
     return {
         "reference_date": reference_date,
@@ -827,11 +804,11 @@ def build_metrics(
         "faturacao_semanal": faturacao_semanal,
         "faturacao_mensal": faturacao_mensal,
         "ticket_diario": ticket_diario,
-        "ticket_medio_global": ticket_medio_global,
+        "ticket_medio_global": faturacao_total / len(vendas) if len(vendas) else 0.0,
         "top_clientes": top_clientes,
         "top_clientes_mtd": top_clientes_mtd,
         "pct_top3": pct_top3,
-        "num_clientes": num_clientes,
+        "num_clientes": int(vendas["Cliente"].nunique()) if not vendas.empty else 0,
         "custos_total": custos_total,
         "custos_por_classe": custos_por_classe,
         "proveitos_folha": proveitos_folha,
@@ -841,6 +818,50 @@ def build_metrics(
     }
 
 
+def build_bank_metrics(df_banco: pd.DataFrame, m: dict | None = None) -> dict:
+    banco = df_banco.copy()
+
+    entradas = float(banco.loc[banco["Tipo"] == "entrada", "Valor"].sum())
+    saidas = float(banco.loc[banco["Tipo"] == "saida", "Valor"].sum())
+    saldo_liquido = entradas - saidas
+
+    banco["Mes_Ordem"] = banco["Data"].dt.to_period("M").dt.to_timestamp()
+    banco["Mes"] = banco["Data"].dt.strftime("%b %Y")
+
+    mensal = banco.groupby(["Mes_Ordem", "Mes", "Tipo"], as_index=False)["Valor"].sum().sort_values("Mes_Ordem")
+
+    top_saidas = (
+        banco[banco["Tipo"] == "saida"]
+        .groupby("Descricao", as_index=False)["Valor"]
+        .sum()
+        .sort_values("Valor", ascending=False)
+        .head(10)
+    )
+
+    diferenca_vs_vendas = None
+    pct_diferenca_vs_vendas = None
+
+    if m is not None:
+        vendas_base = m.get("mtd", 0)
+        diferenca_vs_vendas = entradas - vendas_base
+        pct_diferenca_vs_vendas = safe_pct(entradas, vendas_base)
+
+    alertas_banco = [{
+        "level": "green" if saldo_liquido >= 0 else "red",
+        "title": "Saldo bancário líquido",
+        "text": "As entradas bancárias são superiores às saídas." if saldo_liquido >= 0 else "As saídas bancárias são superiores às entradas.",
+    }]
+
+    return {
+        "entradas": entradas,
+        "saidas": saidas,
+        "saldo_liquido": saldo_liquido,
+        "mensal": mensal,
+        "top_saidas": top_saidas,
+        "diferenca_vs_vendas": diferenca_vs_vendas,
+        "pct_diferenca_vs_vendas": pct_diferenca_vs_vendas,
+        "alertas_banco": alertas_banco,
+    }
 def kpi_card(label: str, value: str, subtitle: str = "", icon: str = "📊") -> None:
     st.markdown(
         f"""
@@ -947,572 +968,345 @@ def template_download_card(title: str, description: str, df: pd.DataFrame, file_
         use_container_width=True,
     )
 
+def input_vendas_manual() -> pd.DataFrame:
+    st.markdown("### Inserir vendas manualmente")
 
-# =========================================================
-# SIDEBAR
-# =========================================================
-with st.sidebar:
-    st.markdown("## Visão de Gestão")
+    default = pd.DataFrame({
+        "Data": [pd.Timestamp.today().date()],
+        "Cliente": [""],
+        "Documento": [""],
+        "Total": [0.0],
+    })
 
-    pagina = st.radio(
-        "Páginas",
-        [
-            "Resumo de Vendas",
-            "Clientes",
-            "Custos",
-            "Faturação",
-            "Templates e exemplos",
-            "Backoffice de Sugestões",
-        ],
+    df = st.data_editor(
+        default,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="manual_vendas",
     )
 
-    st.divider()
-    st.markdown("### Configuração")
+    df["Data"] = pd.to_datetime(df["Data"], errors="coerce")
+    df["Total"] = pd.to_numeric(df["Total"], errors="coerce")
+    df["Documento"] = df["Documento"].replace("", "N/D")
 
-    pais_classificacao = st.selectbox(
-        "País / regra contabilística",
-        COUNTRY_OPTIONS,
-        index=0,
+    return df.dropna(subset=["Data", "Cliente", "Total"])
+def input_custos_manual() -> pd.DataFrame:
+    st.markdown("### Inserir custos manualmente")
+
+    default = pd.DataFrame({
+        "Data": [pd.Timestamp.today().date()],
+        "Tipo": ["Custo"],
+        "Categoria": [""],
+        "Descricao": [""],
+        "Valor": [0.0],
+    })
+
+    df = st.data_editor(
+        default,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="manual_custos",
     )
 
-    st.divider()
-    st.markdown("### Carregar ficheiros")
+    df["Data"] = pd.to_datetime(df["Data"], errors="coerce")
+    df["Tipo"] = df["Tipo"].astype(str).str.lower()
+    df["Categoria"] = df["Categoria"].astype(str)
+    df["Valor"] = pd.to_numeric(df["Valor"], errors="coerce")
 
-    st.info("📥 Se não tiver os ficheiros no formato certo, vá à página 'Templates e exemplos', descarregue o template e preencha.")
+    return df.dropna(subset=["Data", "Tipo", "Categoria", "Valor"])
+def input_banco_manual() -> pd.DataFrame:
+    st.markdown("### Inserir movimentos bancários")
 
-    vendas_file = st.file_uploader("Ficheiro de Vendas", type=["csv", "xlsx", "xls"])
+    default = pd.DataFrame({
+        "Data": [pd.Timestamp.today().date()],
+        "Descricao": [""],
+        "Tipo": ["Entrada"],
+        "Valor": [0.0],
+        "Referencia": [""],
+    })
 
-    origem_custos = st.radio(
-        "Origem dos custos",
-        ["Balancete", "Folha de custos/proveitos"],
+    df = st.data_editor(
+        default,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="manual_banco",
     )
 
-    if origem_custos == "Balancete":
-        bal_file = st.file_uploader("Balancete", type=["csv", "xlsx", "xls"])
-        folha_file = None
-    else:
-        folha_file = st.file_uploader("Folha de custos/proveitos", type=["csv", "xlsx", "xls"])
-        bal_file = None
-
-    clientes_file = st.file_uploader("Clientes (opcional)", type=["csv", "xlsx", "xls"])
-
-    st.divider()
-    st.markdown("### Colunas mínimas")
-    st.code("Vendas: Data | Cliente | Total")
-    st.caption("Documento é recomendado, mas opcional.")
-
-    if origem_custos == "Balancete":
-        st.code("Balancete: Conta | Descricao | Saldo")
-    else:
-        st.code("Folha: Data | Tipo | Categoria | Descricao | Valor")
-
-    st.code("Clientes: Cliente | NIF | Segmento | Regiao")
+    return standardize_banco(df)
 
 
-# =========================================================
-# HEADER
-# =========================================================
-st.markdown(
-    f"""
-    <div class='hero'>
-        <h1>{APP_TITLE}</h1>
-        <p>{APP_SUBTITLE}</p>
-    </div>
-    """,
-    unsafe_allow_html=True,
+
+pais_classificacao = st.selectbox(
+    "País / regra contabilística",
+    COUNTRY_OPTIONS,
+    index=0,
 )
-
 # =========================================================
-# LOAD + VALIDATE
+# MENU PRINCIPAL
 # =========================================================
-vendas_std = None
-bal_std = None
-folha_std = None
-clientes_std = None
-m = None
 
-tem_origem_custos = (
-    (origem_custos == "Balancete" and bal_file is not None)
-    or (origem_custos == "Folha de custos/proveitos" and folha_file is not None)
-)
+m = st.session_state.get("m")
+vendas_std = st.session_state.get("vendas_std")
+folha_std = st.session_state.get("folha_std")
+banco_std = st.session_state.get("banco_std")
+bank_m = st.session_state.get("bank_m")
 
-if vendas_file is not None and tem_origem_custos:
-    try:
-        vendas_raw = read_uploaded_file(vendas_file)
-        vendas_std = standardize_vendas(vendas_raw)
+PAGINAS = [
+    "Resumo de Vendas",
+    "Clientes",
+    "Custos",
+    "Faturação",
+    "Reconciliação Bancária",
+    "Templates e exemplos",
+    "Backoffice de Sugestões",
+]
 
-        if clientes_file is not None:
-            clientes_raw = read_uploaded_file(clientes_file)
-            clientes_std = standardize_clientes(clientes_raw)
-            _, missing_c = validate_columns(clientes_std, EXPECTED_CLIENTES)
-            if missing_c:
-                st.warning(f"O ficheiro de Clientes foi carregado, mas faltam colunas: {', '.join(missing_c)}")
-                clientes_std = None
+if "pagina" not in st.session_state:
+    st.session_state.pagina = "Resumo de Vendas"
 
-        _, missing_v = validate_columns(vendas_std, EXPECTED_VENDAS)
+cols = st.columns(len(PAGINAS))
 
-        if missing_v:
-            st.error(f"Faltam colunas em Vendas: {', '.join(missing_v)}. Use o template disponível em 'Templates e exemplos'.")
-        else:
-            if origem_custos == "Balancete":
-                bal_raw = read_uploaded_file(bal_file)
-                bal_std = standardize_balancete(bal_raw)
+for col, nome in zip(cols, PAGINAS):
 
-                _, missing_b = validate_columns(bal_std, EXPECTED_BALANCETE)
+    with col:
 
-                if missing_b:
-                    st.error(f"Faltam colunas em Balancete: {', '.join(missing_b)}. Use o template disponível em 'Templates e exemplos'.")
-                else:
-                    m = build_metrics(
-                        vendas_std,
-                        bal_std,
-                        df_clientes=clientes_std,
-                        pais_classificacao=pais_classificacao,
-                    )
-                    st.success(
-                        f"Ficheiros carregados com sucesso. Última data disponível: "
-                        f"{m['reference_date'].strftime('%d/%m/%Y')}"
-                    )
+        ativo = st.session_state.pagina == nome
 
+        if st.button(
+            nome,
+            key=f"menu_{nome}",
+            use_container_width=True,
+            type="primary" if ativo else "secondary",
+        ):
+
+            st.session_state.pagina = nome
+            st.rerun()
+
+pagina = st.session_state.pagina
+
+st.divider()
+   
+# =========================================================
+# ESTADO GLOBAL
+# =========================================================
+# =========================================================
+# PAGES
+# =========================================================
+
+if pagina == "Resumo de Vendas":
+
+    st.markdown("## Resumo de Vendas")
+
+    tab1, tab2 = st.tabs(["✍️ Inserção Manual", "📂 Importar Ficheiro"])
+
+    with tab1:
+        vendas_std = input_vendas_manual()
+
+        folha_std = pd.DataFrame()
+        bal_std = pd.DataFrame({
+            "Conta": ["61"],
+            "Descricao": ["Custos"],
+            "Saldo": [0]
+        })
+
+        if st.button("Gerar análise manual"):
+            if vendas_std.empty:
+                st.warning("Insira pelo menos uma venda.")
             else:
-                folha_raw = read_uploaded_file(folha_file)
-                folha_std = standardize_folha(folha_raw)
+                m = build_metrics(
+                    vendas_std,
+                    bal_std,
+                    df_folha=folha_std,
+                    pais_classificacao=pais_classificacao,
+                )
 
-                _, missing_f = validate_columns(folha_std, EXPECTED_FOLHA)
+                st.session_state["m"] = m
+                st.session_state["vendas_std"] = vendas_std
+                st.session_state["folha_std"] = folha_std
+                st.success("Análise gerada com sucesso.")
 
-                if missing_f:
-                    st.error(f"Faltam colunas na Folha de custos/proveitos: {', '.join(missing_f)}. Use o template disponível em 'Templates e exemplos'.")
-                else:
-                    bal_std = folha_to_balancete(folha_std)
+    with tab2:
+        vendas_file = st.file_uploader("Ficheiro de vendas", type=["csv", "xlsx", "xls"])
+
+        if st.button("Gerar análise ficheiro"):
+            if vendas_file is None:
+                st.warning("Carregue o ficheiro de vendas.")
+            else:
+                try:
+                    vendas_raw = read_uploaded_file(vendas_file)
+                    vendas_std = standardize_vendas(vendas_raw)
+
+                    folha_std = pd.DataFrame()
+                    bal_std = pd.DataFrame({
+                        "Conta": ["61"],
+                        "Descricao": ["Custos"],
+                        "Saldo": [0]
+                    })
 
                     m = build_metrics(
                         vendas_std,
                         bal_std,
                         df_folha=folha_std,
-                        df_clientes=clientes_std,
                         pais_classificacao=pais_classificacao,
                     )
-                    st.success(
-                        f"Ficheiros carregados com sucesso. Última data disponível: "
-                        f"{m['reference_date'].strftime('%d/%m/%Y')}"
-                    )
 
-    except Exception as e:
-        st.error(f"Erro ao processar ficheiros: {e}")
+                    st.session_state["m"] = m
+                    st.session_state["vendas_std"] = vendas_std
+                    st.session_state["folha_std"] = folha_std
+                    st.success("Análise gerada com sucesso.")
 
-else:
-    if pagina != "Backoffice de Sugestões" and pagina != "Templates e exemplos":
-        st.info(
-            "Carregue o ficheiro de Vendas e a origem de custos escolhida na barra lateral "
-            "para ver as páginas de análise."
-        )
+                except Exception as e:
+                    st.error(f"Erro: {e}")
 
+    m = st.session_state.get("m")
 
-# =========================================================
-# PAGES
-# =========================================================
-if pagina == "Resumo de Vendas":
-    st.markdown("## Resumo de Vendas")
-    st.markdown("Indicadores principais do período atual e comparações úteis para decisão.")
-    add_kpi_notes()
-    add_costs_input_notes()
-
-    if m is None:
-        st.warning("Carregue os ficheiros para visualizar esta página.")
-    else:
+    if m is not None:
         c1, c2, c3, c4 = st.columns(4)
 
         with c1:
             kpi_card("Semana Atual", fmt_value(m["semana_atual"]), f"Vs semana anterior: {fmt_pct(m['var_semana'])}", "📅")
         with c2:
-            kpi_card("MTD", fmt_value(m["mtd"]), f"Vs mesmo período ano anterior: {fmt_pct(m['var_mtd_homologo'])}", "📈")
+            kpi_card("MTD", fmt_value(m["mtd"]), f"Vs homólogo: {fmt_pct(m['var_mtd_homologo'])}", "📈")
         with c3:
-            kpi_card("YTD", fmt_value(m["ytd"]), f"Vs mesmo período ano anterior: {fmt_pct(m['var_ytd_homologo'])}", "🏁")
+            kpi_card("YTD", fmt_value(m["ytd"]), f"Vs homólogo: {fmt_pct(m['var_ytd_homologo'])}", "🏁")
         with c4:
             kpi_card("Ticket Médio", fmt_value(m["ticket_medio_global"]), "Valor médio por documento", "🧾")
 
-        st.markdown("### Alertas de gestão")
+    st.markdown("### Evolução da faturação")
 
-        if m["alertas"]:
-            for alerta in m["alertas"]:
-                alert_card(alerta["level"], alerta["title"], alerta["text"])
-        else:
-            st.info("Sem alertas relevantes para os dados carregados.")
+    g1, g2 = st.columns(2)
 
-        st.markdown(
-            """
-            <div class='section-panel'>
-                <div class='section-title'>Evolução recente</div>
-                <div class='section-subtitle'>Últimos dias disponíveis nos ficheiros carregados.</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    with g1:
+        df_plot = m["faturacao_diaria"].copy().tail(14)
 
-        g1, g2 = st.columns(2)
-
-        with g1:
-            df_plot = m["faturacao_diaria"].copy().tail(14)
-
-            if len(df_plot) <= 12:
-                fig1 = px.line(df_plot, x="Dia", y="Total", markers=True, text=df_plot["Total"].round(0))
-                fig1.update_traces(textposition="top center")
-            else:
-                fig1 = px.line(df_plot, x="Dia", y="Total", markers=True)
-
-            fig1.update_layout(
-                margin=dict(l=10, r=10, t=10, b=10),
-                xaxis_title="Dia",
-                yaxis_title="Faturação",
+        fig1 = px.line(
+            df_plot,
+            x="Dia",
+            y="Total",
+            markers=True,
+            text=df_plot["Total"].round(0)
             )
-            st.plotly_chart(fig1, use_container_width=True)
 
-        with g2:
-            df_ticket = m["ticket_diario"].copy().tail(14)
-            fig2 = px.bar(df_ticket, x="Dia", y="TicketMedio", text=df_ticket["TicketMedio"].round(0))
-            fig2.update_traces(textposition="outside")
-            fig2.update_layout(
-                margin=dict(l=10, r=10, t=10, b=10),
-                xaxis_title="Dia",
-                yaxis_title="Ticket Médio",
+        fig1.update_traces(textposition="top center")
+
+        st.plotly_chart(
+            fig1,
+            use_container_width=True,
+            key="grafico_faturacao_diaria"
             )
-            st.plotly_chart(fig2, use_container_width=True)
 
-        render_feedback_box("Resumo de Vendas")
+    with g2:
+        df_ticket = m["ticket_diario"].copy().tail(14)
+
+        df_ticket["TicketMedio"] = pd.to_numeric(
+            df_ticket["TicketMedio"],
+            errors="coerce"
+            ).fillna(0)
+
+        fig2 = px.bar(
+            df_ticket,
+            x="Dia",
+            y="TicketMedio",
+            text=df_ticket["TicketMedio"].round(0),
+            )
+
+        fig2.update_traces(textposition="outside")
+
+        st.plotly_chart(
+            fig2,
+                use_container_width=True,
+                key="grafico_ticket_medio"
+            )
 elif pagina == "Clientes":
+
     st.markdown("## Clientes")
-    st.markdown("Carteira atual e concentração da faturação do mês até à data.")
+    m = st.session_state.get("m")
 
     if m is None:
-        st.warning("Carregue os ficheiros para visualizar esta página.")
+        st.warning("Insira vendas primeiro.")
     else:
         c1, c2 = st.columns(2)
 
         with c1:
             kpi_card("Número de Clientes", f"{m['num_clientes']}", "Clientes únicos", "👥")
         with c2:
-            kpi_card("Dependência Top 3", fmt_pct(m["pct_top3"]), "Peso dos 3 principais clientes no mês", "⚠️")
+            kpi_card("Dependência Top 3", fmt_pct(m["pct_top3"]), "Peso dos 3 principais clientes", "⚠️")
 
-        df_clientes = m["top_clientes_mtd"].copy()
+        st.dataframe(m["top_clientes"], use_container_width=True)
 
-        if not df_clientes.empty:
-            df_clientes["Perc_Faturacao"] = df_clientes["Perc_Faturacao"].round(1)
 
-            fig3 = px.bar(df_clientes, x="Cliente", y="Total", text=df_clientes["Total"].round(0))
-            fig3.update_traces(textposition="outside")
-            fig3.update_layout(
-                margin=dict(l=10, r=10, t=10, b=10),
-                xaxis_title="Cliente",
-                yaxis_title="Faturação",
-            )
-            st.plotly_chart(fig3, use_container_width=True)
-
-            st.dataframe(
-                df_clientes[["Cliente", "Total", "Perc_Faturacao"]]
-                .rename(columns={"Total": "Valor", "Perc_Faturacao": "% Faturação"})
-                .round(2),
-                use_container_width=True,
-            )
-        else:
-            st.info("Sem dados suficientes para top clientes do mês atual.")
-
-        render_feedback_box("Clientes")
 elif pagina == "Custos":
+
     st.markdown("## Custos")
 
-    if origem_custos == "Balancete":
-        st.markdown("Estrutura técnica de custos por classe do balancete.")
-    else:
-        st.markdown("Custos resumidos a partir da folha de custos/proveitos.")
-
-    if m is None:
-        st.warning("Carregue os ficheiros para visualizar esta página.")
-    else:
-        st.caption(
-            f"Regra de classificação em uso: {m['pais_classificacao']}. "
-            "Se a empresa usar um plano adaptado, esta leitura deve ser validada."
-        )
-
-        c1, c2 = st.columns(2)
-
-        with c1:
-            kpi_card("Custos Totais", fmt_value(m["custos_total"]), "Contas classificadas como custo", "💸")
-        with c2:
-            kpi_card("Margem Estimada", fmt_pct(m["margem_estimada"]), "Receita menos custos", "📊")
-
-        if origem_custos == "Folha de custos/proveitos" and folha_std is not None:
-            c3, c4 = st.columns(2)
-
-            with c3:
-                kpi_card("Proveitos na Folha", fmt_value(m["proveitos_folha"]), "Registos marcados como proveito", "🟢")
-            with c4:
-                kpi_card("Custos na Folha", fmt_value(m["custos_folha"]), "Registos marcados como custo", "🔴")
-
-        if not m["custos_por_classe"].empty:
-            g1, g2 = st.columns(2)
-
-            with g1:
-                fig4 = px.pie(m["custos_por_classe"], names="Classe", values="Saldo")
-                fig4.update_layout(margin=dict(l=10, r=10, t=10, b=10))
-                st.plotly_chart(fig4, use_container_width=True)
-
-            with g2:
-                df_custos = m["custos_por_classe"].copy()
-                df_custos["Perc_Custo"] = df_custos["Perc_Custo"].round(1)
-
-                fig5 = px.bar(df_custos, x="Classe", y="Saldo", text=df_custos["Saldo"].round(0))
-                fig5.update_traces(textposition="outside")
-                fig5.update_layout(
-                    margin=dict(l=10, r=10, t=10, b=10),
-                    xaxis_title="Classe",
-                    yaxis_title="Custo",
-                )
-                st.plotly_chart(fig5, use_container_width=True)
-
-            st.dataframe(
-                df_custos[["Classe", "Saldo", "Perc_Custo"]]
-                .rename(columns={"Saldo": "Valor", "Perc_Custo": "% Custo"})
-                .round(2),
-                use_container_width=True,
-            )
-        else:
-            st.warning("Não foram encontrados custos suficientes para análise.")
-
-        if origem_custos == "Folha de custos/proveitos" and folha_std is not None:
-            st.markdown("### Detalhe da folha carregada")
-            st.dataframe(folha_std.sort_values("Data", ascending=False), use_container_width=True)
-
-        render_feedback_box("Custos")
-
-
-elif pagina == "Faturação":
-    st.markdown("## Faturação")
-    st.markdown("Evolução semanal, mensal e acumulados até à data.")
-    add_kpi_notes()
-
-    if m is None:
-        st.warning("Carregue os ficheiros para visualizar esta página.")
-    else:
-        c1, c2, c3, c4 = st.columns(4)
-
-        with c1:
-            kpi_card("Mês até agora", fmt_value(m["mtd"]), f"Vs mês anterior: {fmt_pct(m['var_mtd_mes_ant'])}", "📈")
-        with c2:
-            kpi_card("Mês homólogo", fmt_value(m["mtd_homologo"]), "Mesmo período do ano anterior", "📅")
-        with c3:
-            kpi_card("Ano até agora", fmt_value(m["ytd"]), f"Vs homólogo: {fmt_pct(m['var_ytd_homologo'])}", "🏁")
-        with c4:
-            kpi_card("Ano homólogo", fmt_value(m["ytd_homologo"]), "Ano anterior até à mesma data", "📊")
-
-        g1, g2 = st.columns(2)
-
-        with g1:
-            df_sem = m["faturacao_semanal"].copy().tail(12)
-            fig6 = px.bar(df_sem, x="Semana_Label", y="Total", text=df_sem["Total"].round(0))
-            fig6.update_traces(textposition="outside")
-            fig6.update_layout(
-                margin=dict(l=10, r=10, t=10, b=10),
-                xaxis_title="Semana",
-                yaxis_title="Faturação",
-            )
-            st.plotly_chart(fig6, use_container_width=True)
-
-        with g2:
-            df_fat = m["faturacao_mensal"].copy()
-            fig7 = px.bar(df_fat, x="Mes", y="Total", text=df_fat["Total"].round(0))
-            fig7.update_traces(textposition="outside")
-            fig7.update_layout(
-                margin=dict(l=10, r=10, t=10, b=10),
-                xaxis_title="Mês",
-                yaxis_title="Faturação",
-            )
-            st.plotly_chart(fig7, use_container_width=True)
-
-        resumo = pd.DataFrame({
-            "Indicador": [
-                "Semana Atual",
-                "Semana Anterior",
-                "MTD",
-                "MTD Homólogo",
-                "YTD",
-                "YTD Homólogo",
-                "Variação Semana (%)",
-                "Variação MTD Homólogo (%)",
-                "Variação YTD Homólogo (%)",
-            ],
-            "Valor": [
-                m["semana_atual"],
-                m["semana_anterior"],
-                m["mtd"],
-                m["mtd_homologo"],
-                m["ytd"],
-                m["ytd_homologo"],
-                m["var_semana"],
-                m["var_mtd_homologo"],
-                m["var_ytd_homologo"],
-            ],
-        })
-
-        st.download_button(
-            "Descarregar resumo CSV",
-            data=dataframe_to_csv_download(resumo),
-            file_name="resumo_analise.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-
-        render_feedback_box("Faturação")
-elif pagina == "Templates e exemplos":
-    st.markdown("## Templates e exemplos")
-    st.markdown("Descarregue os ficheiros base, preencha com os seus dados e depois carregue na barra lateral.")
-
-    st.info(
-        "Fluxo recomendado: 1) descarregar template → 2) preencher → 3) guardar em CSV/Excel → 4) carregar na app."
-    )
-
-    exemplo_vendas = pd.DataFrame(
-        {
-            "Data": ["01/04/2026", "02/04/2026", "03/04/2026", "04/04/2026"],
-            "Cliente": ["Cliente A", "Cliente B", "Cliente A", "Cliente C"],
-            "Documento": ["FT 1", "FT 2", "FT 3", "FT 4"],
-            "Total": [1200.50, 850.00, 430.00, 2100.00],
-        }
-    )
-
-    exemplo_bal = pd.DataFrame(
-        {
-            "Conta": ["61", "62", "63", "68", "71"],
-            "Descricao": ["CMVMC", "Fornecimentos e serviços", "Gastos com pessoal", "Gastos financeiros", "Vendas"],
-            "Saldo": [3500.00, 1800.00, 2200.00, 200.00, 9500.00],
-        }
-    )
-
-    exemplo_clientes = pd.DataFrame(
-        {
-            "Cliente": ["Cliente A", "Cliente B", "Cliente C"],
-            "NIF": ["123456789", "987654321", "501234567"],
-            "Segmento": ["Empresa", "Particular", "Empresa"],
-            "Regiao": ["Lisboa", "Porto", "Luanda"],
-            "Pais": ["Portugal", "Portugal", "Angola"],
-            "Email": ["clientea@email.com", "clienteb@email.com", "clientec@email.com"],
-            "Telefone": ["910000001", "920000002", "930000003"],
-        }
-    )
-
-    exemplo_folha = pd.DataFrame(
-        {
-            "Data": ["02/04/2026", "03/04/2026", "05/04/2026", "08/04/2026"],
-            "Tipo": ["Custo", "Custo", "Proveito", "Custo"],
-            "Categoria": ["Renda", "Água e luz", "Vendas diversas", "Salários"],
-            "Descricao": ["Loja abril", "Energia", "Venda balcão", "Equipa"],
-            "Valor": [500.00, 120.00, 950.00, 1200.00],
-        }
-    )
-
-    tab1, tab2, tab3, tab4 = st.tabs(["Vendas", "Balancete", "Clientes", "Folha custos/proveitos"])
+    tab1, tab2 = st.tabs(["✍️ Inserção Manual", "📂 Importar Ficheiro"])
 
     with tab1:
-        template_download_card(
-            "Template de Vendas",
-            "Obrigatório. Use este ficheiro para carregar documentos de venda/faturação.",
-            exemplo_vendas,
-            "template_vendas.csv",
-        )
-        st.markdown("**Colunas mínimas:** `Data`, `Cliente`, `Total`. A coluna `Documento` é recomendada, mas a app consegue preencher como `N/D`.")
+        folha_std = input_custos_manual()
+
+        if st.button("Atualizar custos manual"):
+            atualizar_custos(folha_std)
 
     with tab2:
-        template_download_card(
-            "Template de Balancete",
-            "Use quando tiver exportação contabilística ou estrutura de contas.",
-            exemplo_bal,
-            "template_balancete.csv",
-        )
-        st.markdown("**Colunas mínimas:** `Conta`, `Descricao`, `Saldo`. Contas começadas por 6 são tratadas como custos; contas começadas por 7 como proveitos.")
+        folha_file = st.file_uploader("Ficheiro de custos", type=["csv", "xlsx", "xls"])
 
-    with tab3:
-        template_download_card(
-            "Template de Clientes",
-            "Opcional. Serve para enriquecer a análise por segmento, região, país ou outros atributos do cliente.",
-            exemplo_clientes,
-            "template_clientes.csv",
-        )
-        st.markdown("**Coluna mínima:** `Cliente`. O nome deve coincidir com o campo Cliente do ficheiro de Vendas.")
+        if st.button("Importar custos"):
+            if folha_file is None:
+                st.warning("Carregue o ficheiro de custos.")
+            else:
+                folha_raw = read_uploaded_file(folha_file)
+                folha_std = standardize_folha(folha_raw)
+                atualizar_custos(folha_std)
 
-    with tab4:
-        template_download_card(
-            "Template de Folha custos/proveitos",
-            "Alternativa ao balancete para pequenos negócios que registam receitas e despesas manualmente.",
-            exemplo_folha,
-            "template_folha_custos_proveitos.csv",
-        )
-        st.markdown("**Colunas mínimas:** `Data`, `Tipo`, `Categoria`, `Valor`. O `Tipo` deve ser `Custo` ou `Proveito`.")
+elif pagina == "Faturação":
+
+    st.markdown("## Faturação")
+    m = st.session_state.get("m")
+
+    if m is None:
+        st.warning("Insira vendas primeiro.")
+    else:
+        df_mes = m["faturacao_mensal"].copy()
+        fig = px.bar(df_mes, x="Mes", y="Total", text=df_mes["Total"].round(0))
+        fig.update_traces(textposition="outside")
+        st.plotly_chart(
+        fig,
+        use_container_width=True,
+        key="grafico_faturacao_mensal"
+)
+
+
+elif pagina == "Reconciliação Bancária":
+
+    st.markdown("## Reconciliação Bancária")
+
+    tab1, tab2 = st.tabs(["✍️ Inserção Manual", "📂 Importar Ficheiro"])
+
+    with tab1:
+        banco_std = input_banco_manual()
+
+        if st.button("Gerar análise bancária manual"):
+            gerar_banco(banco_std)
+
+    with tab2:
+        banco_file = st.file_uploader("Extrato bancário", type=["csv", "xlsx", "xls"])
+
+        if st.button("Importar extrato bancário"):
+            if banco_file is None:
+                st.warning("Carregue o extrato bancário.")
+            else:
+                banco_raw = read_uploaded_file(banco_file)
+                banco_std = standardize_banco(banco_raw)
+                gerar_banco(banco_std)
+
+elif pagina == "Templates e exemplos":
+
+    st.markdown("## Templates e exemplos")
+    st.info("Aqui depois colocamos os botões para descarregar templates.")
 
 
 elif pagina == "Backoffice de Sugestões":
+
     st.markdown("## Backoffice de Sugestões")
-    st.markdown("Visão interna das sugestões enviadas pelos utilizadores.")
-
     df_feedback = load_feedback()
-
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-        kpi_card("Total de Sugestões", f"{len(df_feedback)}", "Registos guardados")
-
-    with c2:
-        kpi_card(
-            "Páginas com Sugestões",
-            f"{df_feedback['pagina'].nunique() if not df_feedback.empty else 0}",
-            "Áreas com feedback",
-        )
-
-    with c3:
-        ultima_data = (
-            pd.to_datetime(df_feedback["timestamp"], errors="coerce").max().strftime("%d/%m/%Y %H:%M")
-            if not df_feedback.empty and pd.to_datetime(df_feedback["timestamp"], errors="coerce").notna().any()
-            else "Sem dados"
-        )
-        kpi_card("Última Sugestão", ultima_data, "Mais recente")
-
-    if df_feedback.empty:
-        st.info("Ainda não existem sugestões registadas.")
-    else:
-        st.markdown("### Resumo por página")
-
-        resumo_paginas = (
-            df_feedback.groupby("pagina", as_index=False)
-            .size()
-            .rename(columns={"size": "Quantidade"})
-            .sort_values("Quantidade", ascending=False)
-        )
-
-        fig_fb = px.bar(
-            resumo_paginas,
-            x="pagina",
-            y="Quantidade",
-            text="Quantidade",
-        )
-
-        fig_fb.update_traces(textposition="outside")
-        fig_fb.update_layout(
-            margin=dict(l=10, r=10, t=10, b=10),
-            xaxis_title="Página",
-            yaxis_title="Sugestões",
-        )
-
-        st.plotly_chart(fig_fb, use_container_width=True)
-
-        st.markdown("### Registos")
-
-        st.dataframe(
-            df_feedback.sort_values("timestamp", ascending=False),
-            use_container_width=True,
-        )
-
-        st.download_button(
-            "Descarregar sugestões CSV",
-            data=dataframe_to_csv_download(df_feedback),
-            file_name="sugestoes_utilizadores.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+    st.dataframe(df_feedback, use_container_width=True)
